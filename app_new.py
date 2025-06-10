@@ -14,12 +14,20 @@ import socket
 import platform
 import json
 from datetime import timezone
+import smtplib
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
 
 # Remover importação de secrets2.py e ler segredos das variáveis de ambiente
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 SERVIDOR_URLS = ast.literal_eval(os.environ.get("SERVIDOR_URLS", "{}"))
 PASSWORD = os.environ.get("SENHA", "iptv2024")
+
+EMAIL_USER = os.environ.get("EMAIL_USER")
+EMAIL_PASS = os.environ.get("EMAIL_PASS")
+# Permitir múltiplos destinatários de e-mail
+EMAIL_TO = os.environ.get("EMAIL_TO", "").split(",") if os.environ.get("EMAIL_TO") else []
 
 # Função para mascarar URL
 # Agora retorna sempre apenas "Oculto"
@@ -42,18 +50,23 @@ def init_telegram_bot():
 # Função para enviar mensagem no Telegram com retry
 def send_telegram_message(message, bot):
     if bot is None:
-        return
-        
-    for attempt in range(3):
-        try:
-            bot.send_message(TELEGRAM_CHAT_ID, message, parse_mode='HTML')
-            return
-        except Exception as e:
-            if attempt == 2:
-                st.error(f"❌ Erro ao enviar mensagem para o Telegram (tentativa {attempt + 1}/3)")
-            else:
-                time.sleep(2)
-                continue
+        pass
+    else:
+        for attempt in range(3):
+            try:
+                bot.send_message(TELEGRAM_CHAT_ID, message, parse_mode='HTML')
+                break
+            except Exception as e:
+                if attempt == 2:
+                    st.error(f"❌ Erro ao enviar mensagem para o Telegram (tentativa {attempt + 1}/3)")
+                else:
+                    time.sleep(2)
+                    continue
+    # Enviar e-mail também
+    try:
+        send_email_notification("Alerta Monitor IPTV", message)
+    except Exception as e:
+        st.warning(f"Erro ao enviar e-mail: {e}")
 
 # Função para verificar uma única URL com retentativas
 def check_single_url(url, servidor_nome, bot):
@@ -152,6 +165,10 @@ with st.sidebar:
         ["Online", "Offline"],
         default=["Online", "Offline"]
     )
+    if st.checkbox("🔓 Modo Público (só leitura)"):
+        st.session_state.authenticated = True
+        st.info("Você está no modo público. Apenas visualização, sem acesso a configurações sensíveis.")
+        st.stop()
 
 # Título principal
 st.title("📺 Monitor de Servidores IPTV")
@@ -276,6 +293,55 @@ def send_daily_report(bot):
         msg += f"\n<b>{s}</b>: Uptime: {uptime_percent[s]:.1f}% | Incidentes: {incidentes[s]}"
     send_telegram_message(msg, bot)
 
+# --- Relatório semanal/mensal automático ---
+def send_periodic_report(bot, period='semanal'):
+    if bot is None and not EMAIL_TO:
+        return
+    try:
+        with open('historico_uptime.json', 'r', encoding='utf-8') as f:
+            history = json.load(f)
+    except Exception:
+        history = []
+    if not history:
+        return
+    now = datetime.now(TZ)
+    if period == 'semanal':
+        start = now - pd.Timedelta(days=7)
+        title = '📊 Relatório Semanal IPTV'
+    else:
+        start = now - pd.Timedelta(days=30)
+        title = '📊 Relatório Mensal IPTV'
+    filtered = [h for h in history if h['timestamp'] > start]
+    if not filtered:
+        return
+    servidores = list(filtered[-1]['status'].keys())
+    total = len(filtered)
+    online_counts = {s: 0 for s in servidores}
+    for h in filtered:
+        for s in servidores:
+            if h['status'].get(s):
+                online_counts[s] += 1
+    uptime_percent = {s: (online_counts[s]/total)*100 for s in servidores}
+    incidentes = {s: total-online_counts[s] for s in servidores}
+    msg = f'<b>{title}</b>\n'
+    for s in servidores:
+        msg += f"\n<b>{s}</b>: Uptime: {uptime_percent[s]:.1f}% | Incidentes: {incidentes[s]}"
+    send_telegram_message(msg, bot)
+    send_email_notification(title, msg)
+
+# --- Agendamento automático semanal/mensal ---
+now = datetime.now(TZ)
+if now.weekday() == 0 and now.hour == 8 and 'last_weekly_report' not in st.session_state:
+    send_periodic_report(bot, 'semanal')
+    st.session_state['last_weekly_report'] = now.date()
+if 'last_weekly_report' in st.session_state and st.session_state['last_weekly_report'] != now.date():
+    del st.session_state['last_weekly_report']
+if now.day == 1 and now.hour == 8 and 'last_monthly_report' not in st.session_state:
+    send_periodic_report(bot, 'mensal')
+    st.session_state['last_monthly_report'] = now.month
+if 'last_monthly_report' in st.session_state and st.session_state['last_monthly_report'] != now.month:
+    del st.session_state['last_monthly_report']
+
 # --- Exibir Última Mensagem de Erro ---
 # Salva última mensagem de erro para cada servidor
 if 'last_error' not in st.session_state:
@@ -345,6 +411,37 @@ if show_history and st.session_state.history:
     st.bar_chart(uptime_df.set_index('servidor')['uptime'])
     # Gráfico de tendência do tempo de resposta
     st.subheader("📉 Tendência do Tempo de Resposta (últimas 24h)")
+    if 'df' in st.session_state:
+        trend_df = st.session_state.df[['Nome', 'Tempo de Resposta']].copy()
+        trend_df['Tempo de Resposta'] = trend_df['Tempo de Resposta'].apply(lambda x: float(x.replace('s','')) if x != 'N/A' else None)
+        st.line_chart(trend_df.set_index('Nome')['Tempo de Resposta'])
+
+# --- Filtros avançados por período ---
+st.subheader("⏳ Filtro por Período")
+col1, col2 = st.columns(2)
+with col1:
+    data_inicio = st.date_input("Data inicial", value=datetime.now(TZ).date() - pd.Timedelta(days=1))
+with col2:
+    data_fim = st.date_input("Data final", value=datetime.now(TZ).date())
+
+# Filtrar histórico por período
+history_filtered = [
+    h for h in st.session_state.history
+    if data_inicio <= h['timestamp'].date() <= data_fim
+]
+
+# --- Gráficos detalhados ---
+if show_history and history_filtered:
+    st.subheader("📊 Uptime por Servidor no Período")
+    history_df = pd.DataFrame([
+        {'timestamp': h['timestamp'], 'servidor': k, 'status': v}
+        for h in history_filtered
+        for k, v in h['status'].items()
+    ])
+    uptime_df = history_df.groupby('servidor')['status'].mean().reset_index()
+    uptime_df['uptime'] = (uptime_df['status'] * 100).round(2)
+    st.bar_chart(uptime_df.set_index('servidor')['uptime'])
+    st.subheader("📉 Tempo de Resposta Médio por Servidor")
     if 'df' in st.session_state:
         trend_df = st.session_state.df[['Nome', 'Tempo de Resposta']].copy()
         trend_df['Tempo de Resposta'] = trend_df['Tempo de Resposta'].apply(lambda x: float(x.replace('s','')) if x != 'N/A' else None)
@@ -434,3 +531,30 @@ if 'telegram_initialized' not in st.session_state and bot is not None:
         st.success("✅ Bot do Telegram conectado com sucesso!")
     except Exception as e:
         st.warning("⚠️ Monitor iniciado, mas não foi possível enviar mensagem no Telegram.")
+
+def send_email_notification(subject, body):
+    if not (EMAIL_USER and EMAIL_PASS and EMAIL_TO):
+        return
+    try:
+        msg = MIMEMultipart()
+        msg['From'] = EMAIL_USER
+        msg['To'] = ", ".join(EMAIL_TO)
+        msg['Subject'] = subject
+        msg.attach(MIMEText(body, 'html'))
+        with smtplib.SMTP_SSL('smtp.gmail.com', 465) as server:
+            server.login(EMAIL_USER, EMAIL_PASS)
+            server.sendmail(EMAIL_USER, EMAIL_TO, msg.as_string())
+    except Exception as e:
+        st.warning(f"Erro ao enviar e-mail: {e}")
+
+# --- Interface mobile responsiva ---
+st.markdown("""
+<style>
+@media (max-width: 600px) {
+  .block-container {padding: 0.5rem !important;}
+  .stButton>button {width: 100% !important;}
+  .stDataFrame {font-size: 0.9em !important;}
+  .stSidebar {width: 100vw !important;}
+}
+</style>
+""", unsafe_allow_html=True)
