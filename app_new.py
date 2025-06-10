@@ -6,13 +6,20 @@ import pandas as pd
 import threading
 import telebot
 from urllib.parse import urlparse
-from secrets2 import TELEGRAM_TOKEN, TELEGRAM_CHAT_ID, SERVIDOR_URLS
+import os
+import ast
 import pytz
 import io
 import socket
 import platform
 import json
 from datetime import timezone
+
+# Remover importação de secrets2.py e ler segredos das variáveis de ambiente
+TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
+TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
+SERVIDOR_URLS = ast.literal_eval(os.environ.get("SERVIDOR_URLS", "{}"))
+PASSWORD = os.environ.get("SENHA", "iptv2024")
 
 # Função para mascarar URL
 # Agora retorna sempre apenas "Oculto"
@@ -372,7 +379,6 @@ st.dataframe(
 )
 
 # --- Autenticação simples por senha ---
-PASSWORD = "iptv2024"  # Troque para uma senha forte
 if 'authenticated' not in st.session_state:
     st.session_state.authenticated = False
 if not st.session_state.authenticated:
